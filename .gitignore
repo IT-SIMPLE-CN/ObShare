@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build output (generated from main.ts)
+main.js
+
+# Plugin data (contains user settings)
+data.json
+
+# Claude Code
+.claude/
+
+# Lock files (optional, uncomment if needed)
+# package-lock.json
+
+# OS files
+.DS_Store

@@ -1,6 +1,5 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, MarkdownRenderer, Component } from 'obsidian';
-import { FeishuApiClient, createFeishuClient } from './feishu-api';
-import { CryptoUtils } from './crypto-utils';
+import { FeishuApiClient, createFeishuClient, createFeishuClientWithProxy } from './feishu-api';
 import { CalloutConverter, CalloutInfo } from './callout-converter';
 import { YamlProcessor, YamlInfo } from './yaml-processor';
 import { LinkProcessor } from './link-processor';
@@ -74,8 +73,15 @@ interface UploadHistoryItem {
 
 // 插件设置接口
 interface FeishuUploaderSettings {
+	// Token 代理模式（推荐）
+	tokenProxyUrl: string;     // Workers URL，如 https://obshare-token.xxx.workers.dev
+	tokenProxyApiKey: string;  // 访问代理的 API Key
+
+	// 直连模式（兼容旧版本）
 	appId: string;
 	appSecret: string;
+
+	// 通用设置
 	folderToken: string;
 	userId: string;
 	uploadHistory: UploadHistoryItem[];
@@ -90,6 +96,8 @@ interface FeishuUploaderSettings {
 
 // 默认设置
 const DEFAULT_SETTINGS: FeishuUploaderSettings = {
+	tokenProxyUrl: '',
+	tokenProxyApiKey: '',
 	appId: '',
 	appSecret: '',
 	folderToken: '',
@@ -114,8 +122,6 @@ export default class FeishuUploaderPlugin extends Plugin {
 	public notificationManager = new NotificationManager();
 	// 智能更新管理器
 	public smartUpdateManager: SmartUpdateManager | null = null;
-	// 上次保存的敏感数据哈希，用于检测变化
-	private lastSensitiveDataHash: string | null = null;
 
 	applyDebugLoggingSetting(): void {
 		FeishuApiClient.setDebugEnabled(this.settings.debugLoggingEnabled);
@@ -124,7 +130,6 @@ export default class FeishuUploaderPlugin extends Plugin {
 		CalloutConverter.setDebugEnabled(this.settings.debugLoggingEnabled);
 		YamlProcessor.setDebugEnabled(this.settings.debugLoggingEnabled);
 		LinkProcessor.setDebugEnabled(this.settings.debugLoggingEnabled);
-		CryptoUtils.setDebugEnabled(this.settings.debugLoggingEnabled);
 	}
 
 	override async onload() {
@@ -184,34 +189,77 @@ export default class FeishuUploaderPlugin extends Plugin {
 	}
 	
 	/**
+	 * 检查是否使用代理模式
+	 */
+	private isProxyMode(): boolean {
+		return !!(this.settings.tokenProxyUrl && this.settings.tokenProxyApiKey);
+	}
+
+	/**
+	 * 检查是否使用直连模式
+	 */
+	private isDirectMode(): boolean {
+		return !!(this.settings.appId && this.settings.appSecret);
+	}
+
+	/**
 	 * 初始化飞书API客户端
 	 */
 	private initializeFeishuClient(): void {
-		if (this.settings.appId && this.settings.appSecret) {
-			// 创建异步回调包装函数
-			const asyncCallback = () => {
-				this.incrementApiCallCount().catch(error => {
-					const errorMessage = error instanceof Error ? error.message : String(error);
-					console.error(`[飞书插件] API调用计数更新失败: ${errorMessage}`);
-					if (this.settings.debugLoggingEnabled) {
-						console.debug('[飞书插件] API调用计数更新失败详情:', error);
-					}
-				});
-			};
-			
-			// 如果客户端已存在，更新凭据而不是重新创建
+		// 创建异步回调包装函数
+		const asyncCallback = () => {
+			this.incrementApiCallCount().catch(error => {
+				const errorMessage = error instanceof Error ? error.message : String(error);
+				console.error(`[飞书插件] API调用计数更新失败: ${errorMessage}`);
+				if (this.settings.debugLoggingEnabled) {
+					console.debug('[飞书插件] API调用计数更新失败详情:', error);
+				}
+			});
+		};
+
+		// 优先使用代理模式
+		if (this.isProxyMode()) {
+			// 代理模式
+			if (this.feishuClient) {
+				this.feishuClient.updateProxyCredentials(this.settings.tokenProxyUrl, this.settings.tokenProxyApiKey);
+			} else {
+				this.feishuClient = createFeishuClientWithProxy(
+					this.settings.tokenProxyUrl,
+					this.settings.tokenProxyApiKey,
+					this.app,
+					asyncCallback
+				);
+			}
+
+			if (this.feishuRichClient) {
+				this.feishuRichClient.updateProxyCredentials(this.settings.tokenProxyUrl, this.settings.tokenProxyApiKey);
+			} else {
+				this.feishuRichClient = createFeishuClientWithProxy(
+					this.settings.tokenProxyUrl,
+					this.settings.tokenProxyApiKey,
+					this.app,
+					asyncCallback
+				);
+			}
+
+			// 初始化智能更新管理器
+			if (this.feishuClient) {
+				this.smartUpdateManager = new SmartUpdateManager(this.feishuClient);
+			}
+		} else if (this.isDirectMode()) {
+			// 直连模式（兼容旧版本）
 			if (this.feishuClient) {
 				this.feishuClient.updateCredentials(this.settings.appId, this.settings.appSecret);
 			} else {
 				this.feishuClient = createFeishuClient(this.settings.appId, this.settings.appSecret, this.app, asyncCallback);
 			}
-			
+
 			if (this.feishuRichClient) {
 				this.feishuRichClient.updateCredentials(this.settings.appId, this.settings.appSecret);
 			} else {
 				this.feishuRichClient = createFeishuClient(this.settings.appId, this.settings.appSecret, this.app, asyncCallback);
 			}
-			
+
 			// 初始化智能更新管理器
 			if (this.feishuClient) {
 				this.smartUpdateManager = new SmartUpdateManager(this.feishuClient);
@@ -232,31 +280,7 @@ export default class FeishuUploaderPlugin extends Plugin {
 	async loadSettings() {
 		const loadedData = await this.loadData();
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
-		
-		// 检查是否有明文敏感数据需要加密
-		const sensitiveFields = ['appId', 'appSecret', 'folderToken', 'userId'] as const;
-		let hasPlaintextData = false;
-		for (const field of sensitiveFields) {
-			const value = (loadedData as any)?.[field];
-			if (value && typeof value === 'string' && !CryptoUtils.isEncryptedData(value)) {
-				hasPlaintextData = true;
-				break;
-			}
-		}
-		
-		// 解密敏感设置数据
-		this.settings = await CryptoUtils.decryptSensitiveSettings(this.settings);
-		
-		// 初始化敏感数据哈希
-		const sensitiveData = sensitiveFields.map(field => (this.settings as any)[field] || '').join('|');
-		this.lastSensitiveDataHash = await this.simpleHash(sensitiveData);
-		
-		// 如果检测到明文数据，自动加密保存
-		if (hasPlaintextData) {
-			const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-			await this.saveData(encryptedSettings);
-		}
-		
+
 		// 向后兼容性处理：为现有历史记录添加默认docToken
 		if (this.settings.uploadHistory) {
 			this.settings.uploadHistory.forEach(item => {
@@ -265,53 +289,16 @@ export default class FeishuUploaderPlugin extends Plugin {
 				}
 			});
 		}
-		
-
 	}
 
 	async saveSettings() {
-		// 加密敏感数据后保存
-		const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-		await this.saveData(encryptedSettings);
-		
+		await this.saveData(this.settings);
+
 		// 保存设置后重新初始化客户端
 		this.initializeFeishuClient();
 		this.applyDebugLoggingSetting();
-		
-
 	}
 
-	/**
-	 * 优化的保存方法：只在必要时进行加密
-	 */
-	private async saveDataOptimized(): Promise<void> {
-		// 计算当前敏感数据的哈希
-		const sensitiveFields = ['appId', 'appSecret', 'folderToken', 'userId'] as const;
-		const sensitiveData = sensitiveFields.map(field => (this.settings as any)[field] || '').join('|');
-		const currentHash = await this.simpleHash(sensitiveData);
-		
-		// 如果敏感数据没有变化，直接保存原始数据
-		if (this.lastSensitiveDataHash === currentHash) {
-			await this.saveData(this.settings);
-			return;
-		}
-		
-		// 敏感数据有变化，需要加密
-		const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-		await this.saveData(encryptedSettings);
-		this.lastSensitiveDataHash = currentHash;
-	}
-
-	/**
-	 * 简单哈希函数
-	 */
-	private async simpleHash(data: string): Promise<string> {
-		const encoder = new TextEncoder();
-		const dataBuffer = encoder.encode(data);
-		const hashBuffer = await crypto.subtle.digest('SHA-256', dataBuffer);
-		const hashArray = Array.from(new Uint8Array(hashBuffer));
-		return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-	}
 
 
 
@@ -446,7 +433,7 @@ export default class FeishuUploaderPlugin extends Plugin {
 		
 		if (!client) {
 			console.error('[飞书插件] 上传失败：客户端未初始化');
-			this.notificationManager.showNotice('请先在设置中配置飞书应用凭证', 5000, 'missing-credentials');
+			this.notificationManager.showNotice('请先在设置中配置 Token 代理或飞书应用凭证', 5000, 'missing-credentials');
 			return;
 		}
 
@@ -977,12 +964,11 @@ export default class FeishuUploaderPlugin extends Plugin {
 		this.settings.uploadCount++;
 		
 		// 文档记录永久保存，不进行清理
-		
-		// 只保存数据，不重新初始化客户端（加密敏感数据）
-		const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-		this.saveData(encryptedSettings);
+
+		// 只保存数据，不重新初始化客户端
+		this.saveData(this.settings);
 	}
-	
+
 	/**
 	 * 更新历史记录中的权限设置
 	 */
@@ -990,9 +976,8 @@ export default class FeishuUploaderPlugin extends Plugin {
 		const historyItem = this.settings.uploadHistory.find(item => item.docToken === docToken);
 		if (historyItem) {
 			historyItem.permissions = permissions;
-			// 只保存数据，不重新初始化客户端（加密敏感数据）
-			const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-			this.saveData(encryptedSettings);
+			// 只保存数据，不重新初始化客户端
+			this.saveData(this.settings);
 		}
 	}
 
@@ -1017,10 +1002,9 @@ export default class FeishuUploaderPlugin extends Plugin {
 				this.settings.uploadHistory.splice(index, 1);
 				this.settings.uploadHistory.unshift(historyItem);
 			}
-			
-			// 只保存数据，不重新初始化客户端（加密敏感数据）
-			const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-			this.saveData(encryptedSettings);
+
+			// 只保存数据，不重新初始化客户端
+			this.saveData(this.settings);
 		}
 	}
 
@@ -1032,9 +1016,8 @@ export default class FeishuUploaderPlugin extends Plugin {
 		const index = this.settings.uploadHistory.findIndex(item => item.docToken === docToken);
 		if (index !== -1) {
 			this.settings.uploadHistory.splice(index, 1);
-			// 只保存数据，不重新初始化客户端（加密敏感数据）
-			const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-			this.saveData(encryptedSettings);
+			// 只保存数据，不重新初始化客户端
+			this.saveData(this.settings);
 		}
 	}
 
@@ -1073,9 +1056,8 @@ export default class FeishuUploaderPlugin extends Plugin {
 	 */
 	async clearUploadHistory(): Promise<void> {
 		this.settings.uploadHistory = [];
-		// 只保存数据，不重新初始化客户端（加密敏感数据）
-		const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-		this.saveData(encryptedSettings);
+		// 只保存数据，不重新初始化客户端
+		this.saveData(this.settings);
 		this.notificationManager.showNotice('已清空上传历史记录', 3000, 'history-cleared');
 	}
 
@@ -1084,9 +1066,8 @@ export default class FeishuUploaderPlugin extends Plugin {
 	 */
 	async resetUploadCount(): Promise<void> {
 		this.settings.uploadCount = 0;
-		// 只保存数据，不重新初始化客户端（加密敏感数据）
-		const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-		this.saveData(encryptedSettings);
+		// 只保存数据，不重新初始化客户端
+		this.saveData(this.settings);
 		this.notificationManager.showNotice('已重置上传次数', 3000, 'count-reset');
 	}
 
@@ -1096,13 +1077,10 @@ export default class FeishuUploaderPlugin extends Plugin {
 	async incrementApiCallCount(): Promise<void> {
 		// 检查是否需要自动重置（每月1日北京时间）
 		await this.checkAndResetApiCount();
-		
-		this.settings.apiCallCount++;
-		// 只保存数据，不重新初始化客户端（加密敏感数据）
-		const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-		this.saveData(encryptedSettings);
-		
 
+		this.settings.apiCallCount++;
+		// 只保存数据，不重新初始化客户端
+		this.saveData(this.settings);
 	}
 
 	/**
@@ -1113,13 +1091,12 @@ export default class FeishuUploaderPlugin extends Plugin {
 		// 转换为北京时间（UTC+8）
 		const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
 		const currentMonth = beijingTime.toISOString().substring(0, 7); // YYYY-MM格式
-		
+
 		if (this.settings.lastResetDate !== currentMonth) {
 			this.settings.apiCallCount = 0;
 			this.settings.lastResetDate = currentMonth;
-			// 只保存数据，不重新初始化客户端（加密敏感数据）
-			const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-			this.saveData(encryptedSettings);
+			// 只保存数据，不重新初始化客户端
+			this.saveData(this.settings);
 		}
 	}
 
@@ -1131,9 +1108,8 @@ export default class FeishuUploaderPlugin extends Plugin {
 		const now = new Date();
 		const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
 		this.settings.lastResetDate = beijingTime.toISOString().substring(0, 7);
-		// 只保存数据，不重新初始化客户端（加密敏感数据）
-		const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-		this.saveData(encryptedSettings);
+		// 只保存数据，不重新初始化客户端
+		this.saveData(this.settings);
 		this.notificationManager.showNotice('已重置API调用次数', 3000, 'api-count-reset');
 	}
 
@@ -1666,17 +1642,95 @@ class FeishuUploaderSettingTab extends PluginSettingTab {
 
 		// 说明文档
 		const descEl = containerEl.createDiv();
-		descEl.createEl('p', { text: '你需要配置飞书应用App ID、App secret、您的飞书用户ID、您的文件夹token才能正常启动此插件' });
+		descEl.createEl('p', { text: '配置您的 Token 代理服务和飞书设置，即可开始分享文档到飞书' });
 		const docLinkP = descEl.createEl('p');
 		docLinkP.createSpan({ text: '完成配置预计需要5-10分钟，请参阅：' });
-		const docLink = docLinkP.createEl('a', { 
+		const docLink = docLinkP.createEl('a', {
 			text: '快速配置您的ObShare',
 			href: 'https://itlueqqx8t.feishu.cn/docx/XUJmdxbf7octOFx3Vt0c3KJ3nWe'
 		});
 		docLink.setAttribute('target', '_blank');
 
+		// Token 代理配置区域
+		containerEl.createEl('h2', { text: 'Token 代理配置（推荐）' });
+		const proxyDescEl = containerEl.createDiv();
+		proxyDescEl.createEl('p', {
+			text: '使用 Token 代理可以安全地管理飞书凭证，无需在本地存储 App ID 和 App Secret。',
+			cls: 'setting-item-description'
+		});
+
+		// Token 代理 URL 设置
+		const tokenProxyUrlSetting = new Setting(containerEl)
+			.setName('Token 代理 URL')
+			.setDesc('您的 Cloudflare Workers Token 代理服务地址')
+			.addText(text => text
+				.setPlaceholder('https://your-worker.workers.dev')
+				.setValue(this.plugin.settings.tokenProxyUrl)
+				.onChange(async (value) => {
+					this.plugin.settings.tokenProxyUrl = value;
+					await this.plugin.saveSettings();
+				}));
+		tokenProxyUrlSetting.nameEl.empty();
+		tokenProxyUrlSetting.nameEl.createSpan({ text: 'Token 代理 URL ' });
+		const urlRequiredSpan = tokenProxyUrlSetting.nameEl.createSpan({ text: '*', cls: 'obshare-required-field' });
+		// 如果使用直连模式，则不显示必填标记
+		if (this.plugin.settings.appId && this.plugin.settings.appSecret) {
+			urlRequiredSpan.style.display = 'none';
+		}
+
+		// API Key 设置
+		const tokenProxyApiKeySetting = new Setting(containerEl)
+			.setName('API Key')
+			.setDesc('用于访问 Token 代理服务的密钥')
+			.addText(text => text
+				.setPlaceholder('输入 API Key')
+				.setValue(this.plugin.settings.tokenProxyApiKey)
+				.onChange(async (value) => {
+					this.plugin.settings.tokenProxyApiKey = value;
+					await this.plugin.saveSettings();
+				}));
+		tokenProxyApiKeySetting.nameEl.empty();
+		tokenProxyApiKeySetting.nameEl.createSpan({ text: 'API Key ' });
+		const apiKeyRequiredSpan = tokenProxyApiKeySetting.nameEl.createSpan({ text: '*', cls: 'obshare-required-field' });
+		// 如果使用直连模式，则不显示必填标记
+		if (this.plugin.settings.appId && this.plugin.settings.appSecret) {
+			apiKeyRequiredSpan.style.display = 'none';
+		}
+
+		// 直连模式配置区域（可折叠）
+		const directModeHeader = containerEl.createEl('h2', { text: '直连模式（高级）' });
+		directModeHeader.style.cursor = 'pointer';
+		directModeHeader.style.userSelect = 'none';
+
+		const directModeContainer = containerEl.createDiv({ cls: 'obshare-direct-mode-container' });
+
+		// 根据是否有代理配置来决定是否折叠
+		const hasProxyConfig = !!(this.plugin.settings.tokenProxyUrl && this.plugin.settings.tokenProxyApiKey);
+		if (hasProxyConfig) {
+			directModeContainer.style.display = 'none';
+			directModeHeader.textContent = '直连模式（高级） ▶';
+		} else {
+			directModeHeader.textContent = '直连模式（高级） ▼';
+		}
+
+		directModeHeader.onclick = () => {
+			if (directModeContainer.style.display === 'none') {
+				directModeContainer.style.display = 'block';
+				directModeHeader.textContent = '直连模式（高级） ▼';
+			} else {
+				directModeContainer.style.display = 'none';
+				directModeHeader.textContent = '直连模式（高级） ▶';
+			}
+		};
+
+		const directModeDescEl = directModeContainer.createDiv();
+		directModeDescEl.createEl('p', {
+			text: '如果您不想使用代理服务，可以直接配置飞书应用凭证。注意：这种方式会在本地存储敏感信息。',
+			cls: 'setting-item-description'
+		});
+
 		// App ID设置
-		const appIdSetting = new Setting(containerEl)
+		const appIdSetting = new Setting(directModeContainer)
 			.setName('App ID')
 			.setDesc('飞书应用的App ID')
 			.addText(text => text
@@ -1686,12 +1740,9 @@ class FeishuUploaderSettingTab extends PluginSettingTab {
 					this.plugin.settings.appId = value;
 					await this.plugin.saveSettings();
 				}));
-		appIdSetting.nameEl.empty();
-		appIdSetting.nameEl.createSpan({ text: 'App ID ' });
-		appIdSetting.nameEl.createSpan({ text: '*', cls: 'obshare-required-field' });
 
 		// App Secret设置
-		const appSecretSetting = new Setting(containerEl)
+		const appSecretSetting = new Setting(directModeContainer)
 			.setName('App Secret')
 			.setDesc('飞书应用的App Secret')
 			.addText(text => text
@@ -1701,9 +1752,9 @@ class FeishuUploaderSettingTab extends PluginSettingTab {
 					this.plugin.settings.appSecret = value;
 					await this.plugin.saveSettings();
 				}));
-		appSecretSetting.nameEl.empty();
-		appSecretSetting.nameEl.createSpan({ text: 'App Secret ' });
-		appSecretSetting.nameEl.createSpan({ text: '*', cls: 'obshare-required-field' });
+
+		// 通用设置区域
+		containerEl.createEl('h2', { text: '通用设置' });
 
 		// 用户ID设置
 		const userIdSetting = new Setting(containerEl)
@@ -1789,7 +1840,7 @@ class FeishuUploaderSettingTab extends PluginSettingTab {
 				.setButtonText('测试连接')
 				.onClick(async () => {
 					if (!this.plugin.feishuClient) {
-						this.plugin.notificationManager.showNotice('请先配置App ID和App Secret', 4000, 'missing-config');
+						this.plugin.notificationManager.showNotice('请先配置 Token 代理或飞书应用凭证', 4000, 'missing-config');
 						return;
 					}
 					

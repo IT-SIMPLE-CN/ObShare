@@ -223,6 +223,9 @@ SvgConverter.DEFAULT_SCALE = 4;
 var _FeishuApiClient = class {
   // 每次删除请求间隔350ms，确保不超过每秒3次
   constructor(appId, appSecret, app, apiCallCountCallback) {
+    // Token 代理模式配置
+    this.tokenProxyUrl = null;
+    this.tokenProxyApiKey = null;
     this.accessToken = null;
     this.tokenExpireTime = 0;
     this.tokenRefreshPromise = null;
@@ -237,6 +240,32 @@ var _FeishuApiClient = class {
     this.appSecret = appSecret;
     this.app = app;
     this.apiCallCountCallback = apiCallCountCallback;
+  }
+  /**
+   * 设置 Token 代理模式
+   * @param proxyUrl Token 代理服务的 URL
+   * @param apiKey 用于访问代理服务的 API Key
+   */
+  setTokenProxy(proxyUrl, apiKey) {
+    this.tokenProxyUrl = proxyUrl;
+    this.tokenProxyApiKey = apiKey;
+    this.accessToken = null;
+    this.tokenExpireTime = 0;
+  }
+  /**
+   * 清除 Token 代理模式，恢复直连
+   */
+  clearTokenProxy() {
+    this.tokenProxyUrl = null;
+    this.tokenProxyApiKey = null;
+    this.accessToken = null;
+    this.tokenExpireTime = 0;
+  }
+  /**
+   * 检查是否使用代理模式
+   */
+  isUsingProxy() {
+    return !!(this.tokenProxyUrl && this.tokenProxyApiKey);
   }
   static setDebugEnabled(enabled) {
     this.debugEnabled = enabled;
@@ -320,12 +349,53 @@ var _FeishuApiClient = class {
     if (this.tokenRefreshPromise) {
       return await this.tokenRefreshPromise;
     }
-    this.tokenRefreshPromise = this.performTokenRefresh();
+    if (this.isUsingProxy()) {
+      this.tokenRefreshPromise = this.fetchTokenFromProxy();
+    } else {
+      this.tokenRefreshPromise = this.performTokenRefresh();
+    }
     try {
       const token = await this.tokenRefreshPromise;
       return token;
     } finally {
       this.tokenRefreshPromise = null;
+    }
+  }
+  /**
+   * 从 Token 代理服务获取访问令牌
+   */
+  async fetchTokenFromProxy() {
+    var _a;
+    if (!this.tokenProxyUrl || !this.tokenProxyApiKey) {
+      throw new Error("Token \u4EE3\u7406\u672A\u914D\u7F6E");
+    }
+    const proxyUrl = this.tokenProxyUrl.replace(/\/$/, "");
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${proxyUrl}/token`,
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${this.tokenProxyApiKey}`
+        }
+      });
+      const result = response.json;
+      if (result.error) {
+        throw new Error(`Token \u4EE3\u7406\u9519\u8BEF: ${result.error}`);
+      }
+      if (!result.access_token) {
+        throw new Error("Token \u4EE3\u7406\u8FD4\u56DE\u6570\u636E\u683C\u5F0F\u9519\u8BEF: \u7F3A\u5C11 access_token");
+      }
+      this.accessToken = result.access_token;
+      this.tokenExpireTime = Date.now() + result.expires_in * 1e3;
+      this.debug("[\u98DE\u4E66API] \u4ECE\u4EE3\u7406\u83B7\u53D6 token \u6210\u529F", { cached: result.cached, expires_in: result.expires_in });
+      return result.access_token;
+    } catch (error) {
+      this.logError("[\u98DE\u4E66API] \u4ECE\u4EE3\u7406\u83B7\u53D6 token \u5931\u8D25:", error);
+      if (error instanceof TypeError && ((_a = error.message) == null ? void 0 : _a.includes("Failed to fetch"))) {
+        throw new Error("\u65E0\u6CD5\u8FDE\u63A5\u5230 Token \u4EE3\u7406\u670D\u52A1\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC\u8FDE\u63A5\u548C\u4EE3\u7406 URL");
+      }
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(`\u83B7\u53D6\u8BBF\u95EE\u4EE4\u724C\u5931\u8D25: ${errorMessage}`);
     }
   }
   /**
@@ -1631,11 +1701,27 @@ var _FeishuApiClient = class {
       throw error;
     }
   }
+  /**
+   * 更新凭据（直连模式）
+   */
   updateCredentials(appId, appSecret) {
     this.appId = appId;
     this.appSecret = appSecret;
     this.accessToken = null;
     this.tokenExpireTime = 0;
+    this.tokenProxyUrl = null;
+    this.tokenProxyApiKey = null;
+  }
+  /**
+   * 更新代理凭据（代理模式）
+   */
+  updateProxyCredentials(tokenProxyUrl, tokenProxyApiKey) {
+    this.tokenProxyUrl = tokenProxyUrl;
+    this.tokenProxyApiKey = tokenProxyApiKey;
+    this.accessToken = null;
+    this.tokenExpireTime = 0;
+    this.appId = "";
+    this.appSecret = "";
   }
   /**
    * 添加Mermaid图片到缓存
@@ -2104,266 +2190,11 @@ FeishuApiClient.mermaidImageCache = /* @__PURE__ */ new Map();
 function createFeishuClient(appId, appSecret, app, apiCallCountCallback) {
   return new FeishuApiClient(appId, appSecret, app, apiCallCountCallback);
 }
-
-// crypto-utils.ts
-var _CryptoUtils = class {
-  static setDebugEnabled(enabled) {
-    this.debugEnabled = enabled;
-  }
-  static debug(...args) {
-    if (this.debugEnabled) {
-      console.debug(...args);
-    }
-  }
-  static logError(summary, error, details) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    console.error(summary, errorMessage);
-    this.debug(`${summary} \u8BE6\u60C5:`, {
-      ...details,
-      error,
-      errorMessage,
-      errorStack: error instanceof Error ? error.stack : void 0
-    });
-  }
-  /**
-   * 获取缓存的加密密钥，如果不存在则生成新的
-   */
-  static async getEncryptionKey() {
-    if (this.encryptionKey) {
-      return this.encryptionKey;
-    }
-    this.encryptionKey = await this.generateDeviceKey();
-    return this.encryptionKey;
-  }
-  /**
-   * 生成基于设备特征的固定密钥
-   * 使用设备的硬件和系统信息生成唯一且稳定的密钥
-   */
-  static async generateDeviceKey() {
-    const deviceInfo = [
-      navigator.userAgent,
-      // 用户代理
-      navigator.platform,
-      // 平台信息
-      navigator.language,
-      // 语言设置
-      screen.width + "x" + screen.height,
-      // 屏幕分辨率
-      new Date().getTimezoneOffset().toString(),
-      // 时区偏移
-      window.location.hostname || "obsidian",
-      // 主机名
-      "feishu-plugin-v1"
-      // 插件标识
-    ].join("|");
-    const encoder = new TextEncoder();
-    const data = encoder.encode(deviceInfo);
-    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-    return await crypto.subtle.importKey(
-      "raw",
-      hashBuffer,
-      { name: this.ALGORITHM },
-      false,
-      ["encrypt", "decrypt"]
-    );
-  }
-  /**
-   * 加密敏感字符串
-   * @param plaintext 明文字符串
-   * @returns 加密后的字符串（Base64编码）
-   */
-  static async encrypt(plaintext) {
-    if (!plaintext || plaintext.trim() === "") {
-      return plaintext;
-    }
-    if (this.lastEncryptedData === plaintext && this.lastEncryptedResult) {
-      return this.lastEncryptedResult;
-    }
-    try {
-      const key = await this.getEncryptionKey();
-      const iv = crypto.getRandomValues(new Uint8Array(this.IV_LENGTH));
-      const encoder = new TextEncoder();
-      const data = encoder.encode(plaintext);
-      const encrypted = await crypto.subtle.encrypt(
-        {
-          name: this.ALGORITHM,
-          iv
-        },
-        key,
-        data
-      );
-      const combined = new Uint8Array(iv.length + encrypted.byteLength);
-      combined.set(iv);
-      combined.set(new Uint8Array(encrypted), iv.length);
-      const result = this.arrayBufferToBase64(combined.buffer);
-      this.lastEncryptedData = plaintext;
-      this.lastEncryptedResult = result;
-      return result;
-    } catch (error) {
-      this.logError("[\u52A0\u5BC6\u5DE5\u5177] \u52A0\u5BC6\u5931\u8D25:", error);
-      return plaintext;
-    }
-  }
-  /**
-   * 解密敏感字符串
-   * @param encryptedData 加密的字符串（Base64编码）
-   * @returns 解密后的明文字符串
-   */
-  static async decrypt(encryptedData) {
-    if (!encryptedData || encryptedData.trim() === "") {
-      return encryptedData;
-    }
-    if (!this.isEncryptedData(encryptedData)) {
-      return encryptedData;
-    }
-    try {
-      const key = await this.getEncryptionKey();
-      const combined = this.base64ToArrayBuffer(encryptedData);
-      const combinedArray = new Uint8Array(combined);
-      const iv = combinedArray.slice(0, this.IV_LENGTH);
-      const encrypted = combinedArray.slice(this.IV_LENGTH);
-      const decrypted = await crypto.subtle.decrypt(
-        {
-          name: this.ALGORITHM,
-          iv
-        },
-        key,
-        encrypted
-      );
-      const decoder = new TextDecoder();
-      return decoder.decode(decrypted);
-    } catch (error) {
-      this.logError("[\u52A0\u5BC6\u5DE5\u5177] \u89E3\u5BC6\u5931\u8D25:", error);
-      return encryptedData;
-    }
-  }
-  /**
-  * 判断字符串是否为加密数据
-  * @param data 待检查的字符串
-  * @returns 是否为加密数据
-  */
-  static isEncryptedData(data) {
-    const base64Regex = /^[A-Za-z0-9+/]+=*$/;
-    if (!base64Regex.test(data)) {
-      return false;
-    }
-    try {
-      const decoded = this.base64ToArrayBuffer(data);
-      return decoded.byteLength >= this.IV_LENGTH + 1;
-    } catch (e) {
-      return false;
-    }
-  }
-  /**
-   * ArrayBuffer转Base64
-   */
-  static arrayBufferToBase64(buffer) {
-    const bytes = new Uint8Array(buffer);
-    let binary = "";
-    for (let i = 0; i < bytes.byteLength; i++) {
-      const byte = bytes[i];
-      if (byte !== void 0) {
-        binary += String.fromCharCode(byte);
-      }
-    }
-    return btoa(binary);
-  }
-  /**
-   * Base64转ArrayBuffer
-   */
-  static base64ToArrayBuffer(base64) {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes.buffer;
-  }
-  /**
-   * 加密敏感设置对象（带缓存优化）
-   * @param settings 设置对象
-   * @returns 加密后的设置对象
-   */
-  static async encryptSensitiveSettings(settings) {
-    const sensitiveData = this.extractSensitiveData(settings);
-    const sensitiveDataString = JSON.stringify(sensitiveData);
-    if (this.lastEncryptedData === sensitiveDataString && this.lastEncryptedResult) {
-      return { ...settings, ...this.lastEncryptedResult };
-    }
-    const encrypted = { ...settings };
-    const encryptedFields = {};
-    for (const field of this.SENSITIVE_FIELDS) {
-      if (encrypted[field] && typeof encrypted[field] === "string") {
-        encryptedFields[field] = await _CryptoUtils.encrypt(encrypted[field]);
-        encrypted[field] = encryptedFields[field];
-      }
-    }
-    this.lastEncryptedData = sensitiveDataString;
-    this.lastEncryptedResult = encryptedFields;
-    return encrypted;
-  }
-  /**
-   * 提取敏感数据用于缓存比较
-   */
-  static extractSensitiveData(settings) {
-    const sensitiveData = {};
-    for (const field of this.SENSITIVE_FIELDS) {
-      if (settings[field]) {
-        sensitiveData[field] = settings[field];
-      }
-    }
-    return sensitiveData;
-  }
-  /**
-   * 解密敏感设置对象（带缓存优化）
-   * @param settings 加密的设置对象
-   * @returns 解密后的设置对象
-   */
-  static async decryptSensitiveSettings(settings) {
-    const result = { ...settings };
-    let hasEncryptedData = false;
-    for (const field of this.SENSITIVE_FIELDS) {
-      if (settings[field] && typeof settings[field] === "string") {
-        try {
-          if (this.isEncryptedData(settings[field])) {
-            result[field] = await this.decrypt(settings[field]);
-            hasEncryptedData = true;
-          } else {
-            result[field] = settings[field];
-          }
-        } catch (error) {
-          console.warn(`[\u52A0\u5BC6\u5DE5\u5177] \u5B57\u6BB5 ${field} \u89E3\u5BC6\u5931\u8D25\uFF0C\u53EF\u80FD\u662F\u672A\u52A0\u5BC6\u6570\u636E:`, error);
-          result[field] = settings[field];
-        }
-      }
-    }
-    if (!hasEncryptedData) {
-      this.clearCache();
-    }
-    return result;
-  }
-  /**
-   * 清空缓存
-   */
-  static clearCache() {
-    this.lastEncryptedData = null;
-    this.lastEncryptedResult = null;
-  }
-};
-var CryptoUtils = _CryptoUtils;
-// 加密算法配置
-CryptoUtils.ALGORITHM = "AES-GCM";
-CryptoUtils.KEY_LENGTH = 256;
-// 256 bits
-CryptoUtils.IV_LENGTH = 12;
-// 96 bits for GCM
-// 敏感字段列表
-CryptoUtils.SENSITIVE_FIELDS = ["appId", "appSecret", "folderToken", "userId"];
-// 缓存机制
-CryptoUtils.encryptionKey = null;
-CryptoUtils.lastEncryptedData = null;
-CryptoUtils.lastEncryptedResult = null;
-CryptoUtils.debugEnabled = false;
+function createFeishuClientWithProxy(tokenProxyUrl, tokenProxyApiKey, app, apiCallCountCallback) {
+  const client = new FeishuApiClient("", "", app, apiCallCountCallback);
+  client.setTokenProxy(tokenProxyUrl, tokenProxyApiKey);
+  return client;
+}
 
 // callout-converter.ts
 var _CalloutConverter = class {
@@ -5298,6 +5129,8 @@ var NotificationManager = class {
   }
 };
 var DEFAULT_SETTINGS = {
+  tokenProxyUrl: "",
+  tokenProxyApiKey: "",
   appId: "",
   appSecret: "",
   folderToken: "",
@@ -5325,8 +5158,6 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
     this.notificationManager = new NotificationManager();
     // 智能更新管理器
     this.smartUpdateManager = null;
-    // 上次保存的敏感数据哈希，用于检测变化
-    this.lastSensitiveDataHash = null;
   }
   applyDebugLoggingSetting() {
     FeishuApiClient.setDebugEnabled(this.settings.debugLoggingEnabled);
@@ -5335,7 +5166,6 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
     CalloutConverter.setDebugEnabled(this.settings.debugLoggingEnabled);
     YamlProcessor.setDebugEnabled(this.settings.debugLoggingEnabled);
     LinkProcessor.setDebugEnabled(this.settings.debugLoggingEnabled);
-    CryptoUtils.setDebugEnabled(this.settings.debugLoggingEnabled);
   }
   async onload() {
     await this.loadSettings();
@@ -5374,19 +5204,55 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
     this.addSettingTab(new FeishuUploaderSettingTab(this.app, this));
   }
   /**
+   * 检查是否使用代理模式
+   */
+  isProxyMode() {
+    return !!(this.settings.tokenProxyUrl && this.settings.tokenProxyApiKey);
+  }
+  /**
+   * 检查是否使用直连模式
+   */
+  isDirectMode() {
+    return !!(this.settings.appId && this.settings.appSecret);
+  }
+  /**
    * 初始化飞书API客户端
    */
   initializeFeishuClient() {
-    if (this.settings.appId && this.settings.appSecret) {
-      const asyncCallback = () => {
-        this.incrementApiCallCount().catch((error) => {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          console.error(`[\u98DE\u4E66\u63D2\u4EF6] API\u8C03\u7528\u8BA1\u6570\u66F4\u65B0\u5931\u8D25: ${errorMessage}`);
-          if (this.settings.debugLoggingEnabled) {
-            console.debug("[\u98DE\u4E66\u63D2\u4EF6] API\u8C03\u7528\u8BA1\u6570\u66F4\u65B0\u5931\u8D25\u8BE6\u60C5:", error);
-          }
-        });
-      };
+    const asyncCallback = () => {
+      this.incrementApiCallCount().catch((error) => {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        console.error(`[\u98DE\u4E66\u63D2\u4EF6] API\u8C03\u7528\u8BA1\u6570\u66F4\u65B0\u5931\u8D25: ${errorMessage}`);
+        if (this.settings.debugLoggingEnabled) {
+          console.debug("[\u98DE\u4E66\u63D2\u4EF6] API\u8C03\u7528\u8BA1\u6570\u66F4\u65B0\u5931\u8D25\u8BE6\u60C5:", error);
+        }
+      });
+    };
+    if (this.isProxyMode()) {
+      if (this.feishuClient) {
+        this.feishuClient.updateProxyCredentials(this.settings.tokenProxyUrl, this.settings.tokenProxyApiKey);
+      } else {
+        this.feishuClient = createFeishuClientWithProxy(
+          this.settings.tokenProxyUrl,
+          this.settings.tokenProxyApiKey,
+          this.app,
+          asyncCallback
+        );
+      }
+      if (this.feishuRichClient) {
+        this.feishuRichClient.updateProxyCredentials(this.settings.tokenProxyUrl, this.settings.tokenProxyApiKey);
+      } else {
+        this.feishuRichClient = createFeishuClientWithProxy(
+          this.settings.tokenProxyUrl,
+          this.settings.tokenProxyApiKey,
+          this.app,
+          asyncCallback
+        );
+      }
+      if (this.feishuClient) {
+        this.smartUpdateManager = new SmartUpdateManager(this.feishuClient);
+      }
+    } else if (this.isDirectMode()) {
       if (this.feishuClient) {
         this.feishuClient.updateCredentials(this.settings.appId, this.settings.appSecret);
       } else {
@@ -5412,22 +5278,6 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
   async loadSettings() {
     const loadedData = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
-    const sensitiveFields = ["appId", "appSecret", "folderToken", "userId"];
-    let hasPlaintextData = false;
-    for (const field of sensitiveFields) {
-      const value = loadedData == null ? void 0 : loadedData[field];
-      if (value && typeof value === "string" && !CryptoUtils.isEncryptedData(value)) {
-        hasPlaintextData = true;
-        break;
-      }
-    }
-    this.settings = await CryptoUtils.decryptSensitiveSettings(this.settings);
-    const sensitiveData = sensitiveFields.map((field) => this.settings[field] || "").join("|");
-    this.lastSensitiveDataHash = await this.simpleHash(sensitiveData);
-    if (hasPlaintextData) {
-      const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-      await this.saveData(encryptedSettings);
-    }
     if (this.settings.uploadHistory) {
       this.settings.uploadHistory.forEach((item) => {
         if (!item.docToken) {
@@ -5437,35 +5287,9 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
     }
   }
   async saveSettings() {
-    const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-    await this.saveData(encryptedSettings);
+    await this.saveData(this.settings);
     this.initializeFeishuClient();
     this.applyDebugLoggingSetting();
-  }
-  /**
-   * 优化的保存方法：只在必要时进行加密
-   */
-  async saveDataOptimized() {
-    const sensitiveFields = ["appId", "appSecret", "folderToken", "userId"];
-    const sensitiveData = sensitiveFields.map((field) => this.settings[field] || "").join("|");
-    const currentHash = await this.simpleHash(sensitiveData);
-    if (this.lastSensitiveDataHash === currentHash) {
-      await this.saveData(this.settings);
-      return;
-    }
-    const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-    await this.saveData(encryptedSettings);
-    this.lastSensitiveDataHash = currentHash;
-  }
-  /**
-   * 简单哈希函数
-   */
-  async simpleHash(data) {
-    const encoder = new TextEncoder();
-    const dataBuffer = encoder.encode(data);
-    const hashBuffer = await crypto.subtle.digest("SHA-256", dataBuffer);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
   }
   /**
    * 统一收集文档中所有类型的图片信息（包括普通图片、SVG、Mermaid）
@@ -5559,7 +5383,7 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
     const client = this.feishuClient;
     if (!client) {
       console.error("[\u98DE\u4E66\u63D2\u4EF6] \u4E0A\u4F20\u5931\u8D25\uFF1A\u5BA2\u6237\u7AEF\u672A\u521D\u59CB\u5316");
-      this.notificationManager.showNotice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u914D\u7F6E\u98DE\u4E66\u5E94\u7528\u51ED\u8BC1", 5e3, "missing-credentials");
+      this.notificationManager.showNotice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u914D\u7F6E Token \u4EE3\u7406\u6216\u98DE\u4E66\u5E94\u7528\u51ED\u8BC1", 5e3, "missing-credentials");
       return;
     }
     if (!this.settings.folderToken) {
@@ -5941,8 +5765,7 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
     };
     this.settings.uploadHistory.unshift(historyItem);
     this.settings.uploadCount++;
-    const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-    this.saveData(encryptedSettings);
+    this.saveData(this.settings);
   }
   /**
    * 更新历史记录中的权限设置
@@ -5951,8 +5774,7 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
     const historyItem = this.settings.uploadHistory.find((item) => item.docToken === docToken);
     if (historyItem) {
       historyItem.permissions = permissions;
-      const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-      this.saveData(encryptedSettings);
+      this.saveData(this.settings);
     }
   }
   /**
@@ -5969,8 +5791,7 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
         this.settings.uploadHistory.splice(index, 1);
         this.settings.uploadHistory.unshift(historyItem);
       }
-      const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-      this.saveData(encryptedSettings);
+      this.saveData(this.settings);
     }
   }
   /**
@@ -5981,8 +5802,7 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
     const index = this.settings.uploadHistory.findIndex((item) => item.docToken === docToken);
     if (index !== -1) {
       this.settings.uploadHistory.splice(index, 1);
-      const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-      this.saveData(encryptedSettings);
+      this.saveData(this.settings);
     }
   }
   /**
@@ -6013,8 +5833,7 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
    */
   async clearUploadHistory() {
     this.settings.uploadHistory = [];
-    const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-    this.saveData(encryptedSettings);
+    this.saveData(this.settings);
     this.notificationManager.showNotice("\u5DF2\u6E05\u7A7A\u4E0A\u4F20\u5386\u53F2\u8BB0\u5F55", 3e3, "history-cleared");
   }
   /**
@@ -6022,8 +5841,7 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
    */
   async resetUploadCount() {
     this.settings.uploadCount = 0;
-    const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-    this.saveData(encryptedSettings);
+    this.saveData(this.settings);
     this.notificationManager.showNotice("\u5DF2\u91CD\u7F6E\u4E0A\u4F20\u6B21\u6570", 3e3, "count-reset");
   }
   /**
@@ -6032,8 +5850,7 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
   async incrementApiCallCount() {
     await this.checkAndResetApiCount();
     this.settings.apiCallCount++;
-    const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-    this.saveData(encryptedSettings);
+    this.saveData(this.settings);
   }
   /**
    * 检查并重置API调用次数（每月1日北京时间自动重置）
@@ -6045,8 +5862,7 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
     if (this.settings.lastResetDate !== currentMonth) {
       this.settings.apiCallCount = 0;
       this.settings.lastResetDate = currentMonth;
-      const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-      this.saveData(encryptedSettings);
+      this.saveData(this.settings);
     }
   }
   /**
@@ -6057,8 +5873,7 @@ var FeishuUploaderPlugin = class extends import_obsidian4.Plugin {
     const now = new Date();
     const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1e3);
     this.settings.lastResetDate = beijingTime.toISOString().substring(0, 7);
-    const encryptedSettings = await CryptoUtils.encryptSensitiveSettings(this.settings);
-    this.saveData(encryptedSettings);
+    this.saveData(this.settings);
     this.notificationManager.showNotice("\u5DF2\u91CD\u7F6EAPI\u8C03\u7528\u6B21\u6570", 3e3, "api-count-reset");
   }
   /**
@@ -6440,7 +6255,7 @@ var FeishuUploaderSettingTab = class extends import_obsidian4.PluginSettingTab {
     encourageText.style.marginTop = "0px";
     encourageText.style.marginBottom = "10px";
     const descEl = containerEl.createDiv();
-    descEl.createEl("p", { text: "\u4F60\u9700\u8981\u914D\u7F6E\u98DE\u4E66\u5E94\u7528App ID\u3001App secret\u3001\u60A8\u7684\u98DE\u4E66\u7528\u6237ID\u3001\u60A8\u7684\u6587\u4EF6\u5939token\u624D\u80FD\u6B63\u5E38\u542F\u52A8\u6B64\u63D2\u4EF6" });
+    descEl.createEl("p", { text: "\u914D\u7F6E\u60A8\u7684 Token \u4EE3\u7406\u670D\u52A1\u548C\u98DE\u4E66\u8BBE\u7F6E\uFF0C\u5373\u53EF\u5F00\u59CB\u5206\u4EAB\u6587\u6863\u5230\u98DE\u4E66" });
     const docLinkP = descEl.createEl("p");
     docLinkP.createSpan({ text: "\u5B8C\u6210\u914D\u7F6E\u9884\u8BA1\u9700\u89815-10\u5206\u949F\uFF0C\u8BF7\u53C2\u9605\uFF1A" });
     const docLink = docLinkP.createEl("a", {
@@ -6448,20 +6263,66 @@ var FeishuUploaderSettingTab = class extends import_obsidian4.PluginSettingTab {
       href: "https://itlueqqx8t.feishu.cn/docx/XUJmdxbf7octOFx3Vt0c3KJ3nWe"
     });
     docLink.setAttribute("target", "_blank");
-    const appIdSetting = new import_obsidian4.Setting(containerEl).setName("App ID").setDesc("\u98DE\u4E66\u5E94\u7528\u7684App ID").addText((text) => text.setPlaceholder("\u8F93\u5165App ID").setValue(this.plugin.settings.appId).onChange(async (value) => {
+    containerEl.createEl("h2", { text: "Token \u4EE3\u7406\u914D\u7F6E\uFF08\u63A8\u8350\uFF09" });
+    const proxyDescEl = containerEl.createDiv();
+    proxyDescEl.createEl("p", {
+      text: "\u4F7F\u7528 Token \u4EE3\u7406\u53EF\u4EE5\u5B89\u5168\u5730\u7BA1\u7406\u98DE\u4E66\u51ED\u8BC1\uFF0C\u65E0\u9700\u5728\u672C\u5730\u5B58\u50A8 App ID \u548C App Secret\u3002",
+      cls: "setting-item-description"
+    });
+    const tokenProxyUrlSetting = new import_obsidian4.Setting(containerEl).setName("Token \u4EE3\u7406 URL").setDesc("\u60A8\u7684 Cloudflare Workers Token \u4EE3\u7406\u670D\u52A1\u5730\u5740").addText((text) => text.setPlaceholder("https://your-worker.workers.dev").setValue(this.plugin.settings.tokenProxyUrl).onChange(async (value) => {
+      this.plugin.settings.tokenProxyUrl = value;
+      await this.plugin.saveSettings();
+    }));
+    tokenProxyUrlSetting.nameEl.empty();
+    tokenProxyUrlSetting.nameEl.createSpan({ text: "Token \u4EE3\u7406 URL " });
+    const urlRequiredSpan = tokenProxyUrlSetting.nameEl.createSpan({ text: "*", cls: "obshare-required-field" });
+    if (this.plugin.settings.appId && this.plugin.settings.appSecret) {
+      urlRequiredSpan.style.display = "none";
+    }
+    const tokenProxyApiKeySetting = new import_obsidian4.Setting(containerEl).setName("API Key").setDesc("\u7528\u4E8E\u8BBF\u95EE Token \u4EE3\u7406\u670D\u52A1\u7684\u5BC6\u94A5").addText((text) => text.setPlaceholder("\u8F93\u5165 API Key").setValue(this.plugin.settings.tokenProxyApiKey).onChange(async (value) => {
+      this.plugin.settings.tokenProxyApiKey = value;
+      await this.plugin.saveSettings();
+    }));
+    tokenProxyApiKeySetting.nameEl.empty();
+    tokenProxyApiKeySetting.nameEl.createSpan({ text: "API Key " });
+    const apiKeyRequiredSpan = tokenProxyApiKeySetting.nameEl.createSpan({ text: "*", cls: "obshare-required-field" });
+    if (this.plugin.settings.appId && this.plugin.settings.appSecret) {
+      apiKeyRequiredSpan.style.display = "none";
+    }
+    const directModeHeader = containerEl.createEl("h2", { text: "\u76F4\u8FDE\u6A21\u5F0F\uFF08\u9AD8\u7EA7\uFF09" });
+    directModeHeader.style.cursor = "pointer";
+    directModeHeader.style.userSelect = "none";
+    const directModeContainer = containerEl.createDiv({ cls: "obshare-direct-mode-container" });
+    const hasProxyConfig = !!(this.plugin.settings.tokenProxyUrl && this.plugin.settings.tokenProxyApiKey);
+    if (hasProxyConfig) {
+      directModeContainer.style.display = "none";
+      directModeHeader.textContent = "\u76F4\u8FDE\u6A21\u5F0F\uFF08\u9AD8\u7EA7\uFF09 \u25B6";
+    } else {
+      directModeHeader.textContent = "\u76F4\u8FDE\u6A21\u5F0F\uFF08\u9AD8\u7EA7\uFF09 \u25BC";
+    }
+    directModeHeader.onclick = () => {
+      if (directModeContainer.style.display === "none") {
+        directModeContainer.style.display = "block";
+        directModeHeader.textContent = "\u76F4\u8FDE\u6A21\u5F0F\uFF08\u9AD8\u7EA7\uFF09 \u25BC";
+      } else {
+        directModeContainer.style.display = "none";
+        directModeHeader.textContent = "\u76F4\u8FDE\u6A21\u5F0F\uFF08\u9AD8\u7EA7\uFF09 \u25B6";
+      }
+    };
+    const directModeDescEl = directModeContainer.createDiv();
+    directModeDescEl.createEl("p", {
+      text: "\u5982\u679C\u60A8\u4E0D\u60F3\u4F7F\u7528\u4EE3\u7406\u670D\u52A1\uFF0C\u53EF\u4EE5\u76F4\u63A5\u914D\u7F6E\u98DE\u4E66\u5E94\u7528\u51ED\u8BC1\u3002\u6CE8\u610F\uFF1A\u8FD9\u79CD\u65B9\u5F0F\u4F1A\u5728\u672C\u5730\u5B58\u50A8\u654F\u611F\u4FE1\u606F\u3002",
+      cls: "setting-item-description"
+    });
+    const appIdSetting = new import_obsidian4.Setting(directModeContainer).setName("App ID").setDesc("\u98DE\u4E66\u5E94\u7528\u7684App ID").addText((text) => text.setPlaceholder("\u8F93\u5165App ID").setValue(this.plugin.settings.appId).onChange(async (value) => {
       this.plugin.settings.appId = value;
       await this.plugin.saveSettings();
     }));
-    appIdSetting.nameEl.empty();
-    appIdSetting.nameEl.createSpan({ text: "App ID " });
-    appIdSetting.nameEl.createSpan({ text: "*", cls: "obshare-required-field" });
-    const appSecretSetting = new import_obsidian4.Setting(containerEl).setName("App Secret").setDesc("\u98DE\u4E66\u5E94\u7528\u7684App Secret").addText((text) => text.setPlaceholder("\u8F93\u5165App Secret").setValue(this.plugin.settings.appSecret).onChange(async (value) => {
+    const appSecretSetting = new import_obsidian4.Setting(directModeContainer).setName("App Secret").setDesc("\u98DE\u4E66\u5E94\u7528\u7684App Secret").addText((text) => text.setPlaceholder("\u8F93\u5165App Secret").setValue(this.plugin.settings.appSecret).onChange(async (value) => {
       this.plugin.settings.appSecret = value;
       await this.plugin.saveSettings();
     }));
-    appSecretSetting.nameEl.empty();
-    appSecretSetting.nameEl.createSpan({ text: "App Secret " });
-    appSecretSetting.nameEl.createSpan({ text: "*", cls: "obshare-required-field" });
+    containerEl.createEl("h2", { text: "\u901A\u7528\u8BBE\u7F6E" });
     const userIdSetting = new import_obsidian4.Setting(containerEl).setName("\u7528\u6237ID").setDesc("\u60A8\u7684\u98DE\u4E66\u7528\u6237ID").addText((text) => text.setPlaceholder("\u8F93\u5165\u60A8\u7684\u98DE\u4E66\u7528\u6237ID").setValue(this.plugin.settings.userId).onChange(async (value) => {
       this.plugin.settings.userId = value;
       await this.plugin.saveSettings();
@@ -6488,7 +6349,7 @@ var FeishuUploaderSettingTab = class extends import_obsidian4.PluginSettingTab {
     }));
     new import_obsidian4.Setting(containerEl).setName("\u6D4B\u8BD5\u8FDE\u63A5").setDesc("\u6D4B\u8BD5\u98DE\u4E66API\u8FDE\u63A5\u662F\u5426\u6B63\u5E38").addButton((button) => button.setButtonText("\u6D4B\u8BD5\u8FDE\u63A5").onClick(async () => {
       if (!this.plugin.feishuClient) {
-        this.plugin.notificationManager.showNotice("\u8BF7\u5148\u914D\u7F6EApp ID\u548CApp Secret", 4e3, "missing-config");
+        this.plugin.notificationManager.showNotice("\u8BF7\u5148\u914D\u7F6E Token \u4EE3\u7406\u6216\u98DE\u4E66\u5E94\u7528\u51ED\u8BC1", 4e3, "missing-config");
         return;
       }
       try {

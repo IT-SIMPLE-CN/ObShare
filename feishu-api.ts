@@ -80,32 +80,68 @@ export interface ImageInfo {
 
 // 飞书API客户端类
 export class FeishuApiClient {
+    // Token 代理模式配置
+    private tokenProxyUrl: string | null = null;
+    private tokenProxyApiKey: string | null = null;
+
+    // 直连模式配置（兼容旧版本）
     private appId: string;
     private appSecret: string;
+
     private accessToken: string | null = null;
     private tokenExpireTime: number = 0;
     private app?: any;
     private apiCallCountCallback: (() => void) | undefined;
     private tokenRefreshPromise: Promise<string> | null = null; // 防止并发token获取
     private static debugEnabled = false;
-    
+
     // Mermaid图片缓存，用于存储临时生成的图片数据
     private static mermaidImageCache: Map<string, { base64Data: string; svgConvertOptions?: { originalWidth: number; originalHeight: number; scale: number } }> = new Map();
-    
+
     // 飞书API基础URL
     private readonly baseUrl = 'https://open.feishu.cn/open-apis';
-    
+
     // 限速相关属性
     private deleteRequestQueue: Array<() => Promise<any>> = [];
     private isProcessingDeleteQueue = false;
     private lastDeleteRequestTime = 0;
     private readonly DELETE_REQUEST_INTERVAL = 350; // 每次删除请求间隔350ms，确保不超过每秒3次
-    
+
     constructor(appId: string, appSecret: string, app?: any, apiCallCountCallback?: () => void) {
         this.appId = appId;
         this.appSecret = appSecret;
         this.app = app;
         this.apiCallCountCallback = apiCallCountCallback;
+    }
+
+    /**
+     * 设置 Token 代理模式
+     * @param proxyUrl Token 代理服务的 URL
+     * @param apiKey 用于访问代理服务的 API Key
+     */
+    setTokenProxy(proxyUrl: string, apiKey: string): void {
+        this.tokenProxyUrl = proxyUrl;
+        this.tokenProxyApiKey = apiKey;
+        // 清除现有 token，强制从代理获取新 token
+        this.accessToken = null;
+        this.tokenExpireTime = 0;
+    }
+
+    /**
+     * 清除 Token 代理模式，恢复直连
+     */
+    clearTokenProxy(): void {
+        this.tokenProxyUrl = null;
+        this.tokenProxyApiKey = null;
+        this.accessToken = null;
+        this.tokenExpireTime = 0;
+    }
+
+    /**
+     * 检查是否使用代理模式
+     */
+    isUsingProxy(): boolean {
+        return !!(this.tokenProxyUrl && this.tokenProxyApiKey);
     }
 
     static setDebugEnabled(enabled: boolean): void {
@@ -202,21 +238,73 @@ export class FeishuApiClient {
         if (this.accessToken && now < this.tokenExpireTime - 30 * 60 * 1000) {
             return this.accessToken;
         }
-        
+
         // 如果已经有正在进行的token刷新请求，等待它完成
         if (this.tokenRefreshPromise) {
             return await this.tokenRefreshPromise;
         }
-        
-        // 创建新的token刷新Promise
-        this.tokenRefreshPromise = this.performTokenRefresh();
-        
+
+        // 根据模式选择不同的获取方式
+        if (this.isUsingProxy()) {
+            this.tokenRefreshPromise = this.fetchTokenFromProxy();
+        } else {
+            this.tokenRefreshPromise = this.performTokenRefresh();
+        }
+
         try {
             const token = await this.tokenRefreshPromise;
             return token;
         } finally {
             // 清除Promise引用，允许下次刷新
             this.tokenRefreshPromise = null;
+        }
+    }
+
+    /**
+     * 从 Token 代理服务获取访问令牌
+     */
+    private async fetchTokenFromProxy(): Promise<string> {
+        if (!this.tokenProxyUrl || !this.tokenProxyApiKey) {
+            throw new Error('Token 代理未配置');
+        }
+
+        const proxyUrl = this.tokenProxyUrl.replace(/\/$/, ''); // 移除末尾斜杠
+
+        try {
+            const response = await requestUrl({
+                url: `${proxyUrl}/token`,
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${this.tokenProxyApiKey}`,
+                },
+            });
+
+            const result = response.json;
+
+            if (result.error) {
+                throw new Error(`Token 代理错误: ${result.error}`);
+            }
+
+            if (!result.access_token) {
+                throw new Error('Token 代理返回数据格式错误: 缺少 access_token');
+            }
+
+            this.accessToken = result.access_token;
+            this.tokenExpireTime = Date.now() + result.expires_in * 1000;
+
+            this.debug('[飞书API] 从代理获取 token 成功', { cached: result.cached, expires_in: result.expires_in });
+
+            return result.access_token;
+        } catch (error) {
+            this.logError('[飞书API] 从代理获取 token 失败:', error);
+
+            // 检查是否是网络错误
+            if (error instanceof TypeError && (error as any).message?.includes('Failed to fetch')) {
+                throw new Error('无法连接到 Token 代理服务，请检查网络连接和代理 URL');
+            }
+
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            throw new Error(`获取访问令牌失败: ${errorMessage}`);
         }
     }
     
@@ -1929,11 +2017,30 @@ export class FeishuApiClient {
         }
     }
 
+    /**
+     * 更新凭据（直连模式）
+     */
     updateCredentials(appId: string, appSecret: string): void {
         this.appId = appId;
         this.appSecret = appSecret;
         this.accessToken = null;
         this.tokenExpireTime = 0;
+        // 清除代理模式配置
+        this.tokenProxyUrl = null;
+        this.tokenProxyApiKey = null;
+    }
+
+    /**
+     * 更新代理凭据（代理模式）
+     */
+    updateProxyCredentials(tokenProxyUrl: string, tokenProxyApiKey: string): void {
+        this.tokenProxyUrl = tokenProxyUrl;
+        this.tokenProxyApiKey = tokenProxyApiKey;
+        this.accessToken = null;
+        this.tokenExpireTime = 0;
+        // 清除直连模式配置
+        this.appId = '';
+        this.appSecret = '';
     }
     
     /**
@@ -2495,8 +2602,26 @@ export class FeishuApiClient {
 }
 
 /**
- * 创建飞书API客户端实例
+ * 创建飞书API客户端实例（直连模式）
  */
 export function createFeishuClient(appId: string, appSecret: string, app?: any, apiCallCountCallback?: () => void): FeishuApiClient {
     return new FeishuApiClient(appId, appSecret, app, apiCallCountCallback);
+}
+
+/**
+ * 创建飞书API客户端实例（代理模式）
+ * @param tokenProxyUrl Token 代理服务的 URL
+ * @param tokenProxyApiKey 用于访问代理服务的 API Key
+ * @param app Obsidian App 实例
+ * @param apiCallCountCallback API 调用计数回调
+ */
+export function createFeishuClientWithProxy(
+    tokenProxyUrl: string,
+    tokenProxyApiKey: string,
+    app?: any,
+    apiCallCountCallback?: () => void
+): FeishuApiClient {
+    const client = new FeishuApiClient('', '', app, apiCallCountCallback);
+    client.setTokenProxy(tokenProxyUrl, tokenProxyApiKey);
+    return client;
 }

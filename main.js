@@ -65,8 +65,8 @@ var SvgConverter = class {
           try {
             const imgWidth = img.naturalWidth || img.width;
             const imgHeight = img.naturalHeight || img.height;
-            const actualWidth = imgWidth > 0 ? imgWidth : width;
-            const actualHeight = imgHeight > 0 ? imgHeight : height;
+            const actualWidth = imgWidth > width ? imgWidth : width;
+            const actualHeight = imgHeight > height ? imgHeight : height;
             canvas.width = actualWidth * scale;
             canvas.height = actualHeight * scale;
             if (options.backgroundColor) {
@@ -107,26 +107,30 @@ var SvgConverter = class {
    */
   static parseSvgDimensions(svgContent) {
     try {
-      const widthMatch = svgContent.match(/width\s*=\s*["']?(\d+(?:\.\d+)?)(?:px|pt|pc|mm|cm|in)?["']?/i);
-      const heightMatch = svgContent.match(/height\s*=\s*["']?(\d+(?:\.\d+)?)(?:px|pt|pc|mm|cm|in)?["']?/i);
       let width;
       let height;
-      if (widthMatch && widthMatch[1]) {
-        width = parseFloat(widthMatch[1]);
-      }
-      if (heightMatch && heightMatch[1]) {
-        height = parseFloat(heightMatch[1]);
-      }
-      if (!width || !height) {
-        const viewBoxMatch = svgContent.match(/viewBox\s*=\s*["']?([^"']*?)["']?/i);
-        if (viewBoxMatch && viewBoxMatch[1]) {
-          const viewBoxValues = viewBoxMatch[1].trim().split(/\s+/);
-          if (viewBoxValues.length >= 4 && viewBoxValues[2] && viewBoxValues[3]) {
-            const vbWidth = parseFloat(viewBoxValues[2]);
-            const vbHeight = parseFloat(viewBoxValues[3]);
-            if (!isNaN(vbWidth) && !isNaN(vbHeight)) {
-              width = width || vbWidth;
-              height = height || vbHeight;
+      const svgTagMatch = svgContent.match(/<svg\s[^>]*>/i);
+      const svgTag = svgTagMatch ? svgTagMatch[0] : "";
+      if (svgTag) {
+        const widthMatch = svgTag.match(/\bwidth\s*=\s*["']?(\d+(?:\.\d+)?)(?:px|pt|pc|mm|cm|in)?["']?/i);
+        const heightMatch = svgTag.match(/\bheight\s*=\s*["']?(\d+(?:\.\d+)?)(?:px|pt|pc|mm|cm|in)?["']?/i);
+        if (widthMatch && widthMatch[1]) {
+          width = parseFloat(widthMatch[1]);
+        }
+        if (heightMatch && heightMatch[1]) {
+          height = parseFloat(heightMatch[1]);
+        }
+        if (!width || !height) {
+          const viewBoxMatch = svgTag.match(/viewBox\s*=\s*["']([^"']*)["']/i);
+          if (viewBoxMatch && viewBoxMatch[1]) {
+            const viewBoxValues = viewBoxMatch[1].trim().split(/[\s,]+/);
+            if (viewBoxValues.length >= 4 && viewBoxValues[2] && viewBoxValues[3]) {
+              const vbWidth = parseFloat(viewBoxValues[2]);
+              const vbHeight = parseFloat(viewBoxValues[3]);
+              if (!isNaN(vbWidth) && !isNaN(vbHeight)) {
+                width = width || vbWidth;
+                height = height || vbHeight;
+              }
             }
           }
         }
@@ -171,6 +175,8 @@ var SvgConverter = class {
    */
   static getRecommendedOptions(svgContent) {
     const dimensions = this.parseSvgDimensions(svgContent);
+    const MIN_OUTPUT_SIZE = 1024;
+    const MAX_OUTPUT_SIZE = 2e3;
     const defaultOptions = {
       width: 800,
       height: 600,
@@ -180,36 +186,28 @@ var SvgConverter = class {
     if (dimensions.width && dimensions.height) {
       defaultOptions.width = dimensions.width;
       defaultOptions.height = dimensions.height;
-      const maxDimension = Math.max(dimensions.width, dimensions.height);
-      if (maxDimension <= 100) {
-        defaultOptions.scale = 8;
-      } else if (maxDimension <= 200) {
-        defaultOptions.scale = 6;
-      } else if (maxDimension <= 400) {
-        defaultOptions.scale = 4;
-      } else if (maxDimension <= 800) {
-        defaultOptions.scale = 2;
+    }
+    const width = defaultOptions.width;
+    const height = defaultOptions.height;
+    const maxDimension = Math.max(width, height);
+    if (maxDimension * 1 >= MIN_OUTPUT_SIZE) {
+      if (maxDimension > MAX_OUTPUT_SIZE) {
+        defaultOptions.scale = MAX_OUTPUT_SIZE / maxDimension;
       } else {
-        const maxSize = 2e3;
-        if (dimensions.width > maxSize || dimensions.height > maxSize) {
-          const scale = Math.min(maxSize / dimensions.width, maxSize / dimensions.height);
-          defaultOptions.scale = scale;
-        } else {
-          defaultOptions.scale = 1;
-        }
+        defaultOptions.scale = 1;
+      }
+    } else {
+      defaultOptions.scale = Math.ceil(MIN_OUTPUT_SIZE / maxDimension);
+      if (maxDimension * defaultOptions.scale > MAX_OUTPUT_SIZE) {
+        defaultOptions.scale = Math.floor(MAX_OUTPUT_SIZE / maxDimension);
+      }
+      if (maxDimension * defaultOptions.scale < MIN_OUTPUT_SIZE) {
+        defaultOptions.scale = Math.ceil(MIN_OUTPUT_SIZE / maxDimension);
       }
     }
     const result = {};
-    if (dimensions.width !== void 0) {
-      result.width = dimensions.width;
-    } else {
-      result.width = defaultOptions.width;
-    }
-    if (dimensions.height !== void 0) {
-      result.height = dimensions.height;
-    } else {
-      result.height = defaultOptions.height;
-    }
+    result.width = width;
+    result.height = height;
     result.scale = defaultOptions.scale;
     result.backgroundColor = defaultOptions.backgroundColor;
     return result;

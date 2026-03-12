@@ -57,14 +57,16 @@ export class SvgConverter {
                 
                 img.onload = () => {
                     try {
-                        // 获取图片的实际尺寸
+                        // 对于没有 width/height 属性的 SVG，浏览器可能返回 CSS 默认尺寸（如 150×300）
+                        // 优先使用从 viewBox 或选项中解析出的尺寸
                         const imgWidth = img.naturalWidth || img.width;
                         const imgHeight = img.naturalHeight || img.height;
-                        
-                        // 如果图片有实际尺寸，使用实际尺寸；否则使用解析的尺寸
-                        const actualWidth = imgWidth > 0 ? imgWidth : width;
-                        const actualHeight = imgHeight > 0 ? imgHeight : height;
-                        
+
+                        // 只有当 img 实际尺寸明显大于已解析的尺寸时才使用 img 尺寸
+                        // 否则坚持使用 options/viewBox 解析出的尺寸
+                        const actualWidth = (imgWidth > width) ? imgWidth : width;
+                        const actualHeight = (imgHeight > height) ? imgHeight : height;
+
                         // 重新设置canvas尺寸以匹配实际比例
                         canvas.width = actualWidth * scale;
                         canvas.height = actualHeight * scale;
@@ -120,42 +122,46 @@ export class SvgConverter {
      */
     private static parseSvgDimensions(svgContent: string): { width?: number; height?: number } {
         try {
-            // 尝试解析width和height属性，支持带引号和不带引号的值
-            const widthMatch = svgContent.match(/width\s*=\s*["']?(\d+(?:\.\d+)?)(?:px|pt|pc|mm|cm|in)?["']?/i);
-            const heightMatch = svgContent.match(/height\s*=\s*["']?(\d+(?:\.\d+)?)(?:px|pt|pc|mm|cm|in)?["']?/i);
-            
             let width: number | undefined;
             let height: number | undefined;
-            
-            if (widthMatch && widthMatch[1]) {
-                width = parseFloat(widthMatch[1]);
-            }
-            
-            if (heightMatch && heightMatch[1]) {
-                height = parseFloat(heightMatch[1]);
-            }
-            
-            // 如果没有找到width/height，尝试解析viewBox
-            if (!width || !height) {
-                const viewBoxMatch = svgContent.match(/viewBox\s*=\s*["']?([^"']*?)["']?/i);
-                if (viewBoxMatch && viewBoxMatch[1]) {
-                    const viewBoxValues = viewBoxMatch[1].trim().split(/\s+/);
-                    if (viewBoxValues.length >= 4 && viewBoxValues[2] && viewBoxValues[3]) {
-                        // viewBox格式: "x y width height"
-                        const vbWidth = parseFloat(viewBoxValues[2]);
-                        const vbHeight = parseFloat(viewBoxValues[3]);
-                        if (!isNaN(vbWidth) && !isNaN(vbHeight)) {
-                            width = width || vbWidth;
-                            height = height || vbHeight;
+
+            // 先提取 <svg ...> 根元素的开标签，避免匹配子元素属性
+            const svgTagMatch = svgContent.match(/<svg\s[^>]*>/i);
+            const svgTag = svgTagMatch ? svgTagMatch[0] : '';
+
+            if (svgTag) {
+                // 从根 <svg> 标签解析 width 和 height 属性
+                const widthMatch = svgTag.match(/\bwidth\s*=\s*["']?(\d+(?:\.\d+)?)(?:px|pt|pc|mm|cm|in)?["']?/i);
+                const heightMatch = svgTag.match(/\bheight\s*=\s*["']?(\d+(?:\.\d+)?)(?:px|pt|pc|mm|cm|in)?["']?/i);
+
+                if (widthMatch && widthMatch[1]) {
+                    width = parseFloat(widthMatch[1]);
+                }
+                if (heightMatch && heightMatch[1]) {
+                    height = parseFloat(heightMatch[1]);
+                }
+
+                // 如果没有找到 width/height，尝试从根 <svg> 解析 viewBox
+                if (!width || !height) {
+                    const viewBoxMatch = svgTag.match(/viewBox\s*=\s*["']([^"']*)["']/i);
+                    if (viewBoxMatch && viewBoxMatch[1]) {
+                        const viewBoxValues = viewBoxMatch[1].trim().split(/[\s,]+/);
+                        if (viewBoxValues.length >= 4 && viewBoxValues[2] && viewBoxValues[3]) {
+                            const vbWidth = parseFloat(viewBoxValues[2]);
+                            const vbHeight = parseFloat(viewBoxValues[3]);
+                            if (!isNaN(vbWidth) && !isNaN(vbHeight)) {
+                                width = width || vbWidth;
+                                height = height || vbHeight;
+                            }
                         }
                     }
                 }
             }
-            
+
             const result: { width?: number; height?: number } = {};
             if (width !== undefined && width > 0) result.width = width;
             if (height !== undefined && height > 0) result.height = height;
-            
+
             return result;
         } catch (error) {
             // 解析失败时返回空对象，使用默认尺寸
@@ -199,7 +205,10 @@ export class SvgConverter {
      */
     static getRecommendedOptions(svgContent: string): SvgConverterOptions {
         const dimensions = this.parseSvgDimensions(svgContent);
-        
+
+        const MIN_OUTPUT_SIZE = 1024;
+        const MAX_OUTPUT_SIZE = 2000;
+
         // 默认选项
         const defaultOptions = {
             width: 800,
@@ -207,57 +216,44 @@ export class SvgConverter {
             scale: 1,
             backgroundColor: 'transparent'
         };
-        
+
         // 如果能解析出尺寸，使用解析的尺寸
         if (dimensions.width && dimensions.height) {
             defaultOptions.width = dimensions.width;
             defaultOptions.height = dimensions.height;
-            
-            // 根据原始尺寸调整缩放比例
-            const maxDimension = Math.max(dimensions.width, dimensions.height);
-            
-            if (maxDimension <= 100) {
-                // 小图标使用8x缩放保持清晰
-                defaultOptions.scale = 8;
-            } else if (maxDimension <= 200) {
-                // 中小图片使用6x缩放
-                defaultOptions.scale = 6;
-            } else if (maxDimension <= 400) {
-                // 中等图片使用4x缩放
-                defaultOptions.scale = 4;
-            } else if (maxDimension <= 800) {
-                // 较大图片使用2x缩放
-                defaultOptions.scale = 2;
+        }
+
+        const width = defaultOptions.width;
+        const height = defaultOptions.height;
+        const maxDimension = Math.max(width, height);
+
+        // 计算 scale：确保最大边输出不低于 MIN_OUTPUT_SIZE，且不超过 MAX_OUTPUT_SIZE
+        if (maxDimension * 1 >= MIN_OUTPUT_SIZE) {
+            // 原始尺寸已经够大，限制最大输出
+            if (maxDimension > MAX_OUTPUT_SIZE) {
+                defaultOptions.scale = MAX_OUTPUT_SIZE / maxDimension;
             } else {
-                // 超大图片限制最大尺寸
-                const maxSize = 2000;
-                if (dimensions.width > maxSize || dimensions.height > maxSize) {
-                    const scale = Math.min(maxSize / dimensions.width, maxSize / dimensions.height);
-                    defaultOptions.scale = scale;
-                } else {
-                    defaultOptions.scale = 1;
-                }
+                defaultOptions.scale = 1;
+            }
+        } else {
+            // 原始尺寸不够大，放大到至少 MIN_OUTPUT_SIZE
+            defaultOptions.scale = Math.ceil(MIN_OUTPUT_SIZE / maxDimension);
+            // 但不要超过 MAX_OUTPUT_SIZE
+            if (maxDimension * defaultOptions.scale > MAX_OUTPUT_SIZE) {
+                defaultOptions.scale = Math.floor(MAX_OUTPUT_SIZE / maxDimension);
+            }
+            // 兜底：至少保证 MIN_OUTPUT_SIZE
+            if (maxDimension * defaultOptions.scale < MIN_OUTPUT_SIZE) {
+                defaultOptions.scale = Math.ceil(MIN_OUTPUT_SIZE / maxDimension);
             }
         }
-        
+
         const result: SvgConverterOptions = {};
-        
-        // 只设置有明确值的属性
-        if (dimensions.width !== undefined) {
-            result.width = dimensions.width;
-        } else {
-            result.width = defaultOptions.width;
-        }
-        
-        if (dimensions.height !== undefined) {
-            result.height = dimensions.height;
-        } else {
-            result.height = defaultOptions.height;
-        }
-        
+        result.width = width;
+        result.height = height;
         result.scale = defaultOptions.scale;
         result.backgroundColor = defaultOptions.backgroundColor;
-        
+
         return result;
     }
 }
